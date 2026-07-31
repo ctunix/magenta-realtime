@@ -20,6 +20,12 @@ import functools
 import logging
 import time
 
+from . import _gpu_check
+
+# JAX reads allocator configuration while its backend initializes, so set these
+# defaults before importing JAX or modules that transitively import it.
+_gpu_check.configure_jax_memory_defaults()
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -28,7 +34,6 @@ import safetensors.flax as safetensors_flax
 import flax.traverse_util as flaxtu
 
 from . import depthformer
-from . import _gpu_check
 from . import model as model_configs
 from . import spectrostream
 from .. import audio
@@ -377,9 +382,6 @@ class MagentaRT2System:
       require_gpu: If True (default), fail loudly if no CUDA GPU is available
           instead of silently falling back to CPU. Set False for CPU testing.
     """
-    # Apply default XLA memory env vars (idempotent; existing env wins).
-    _gpu_check.configure_jax_memory_defaults()
-
     self._model = model_configs.get_model_class(size)()
     self._size = size
     self._style_model = style_model or musiccoca.MusicCoCa()
@@ -462,6 +464,8 @@ class MagentaRT2System:
           'running single-GPU (no sharding).', len(cuda)
       )
       return
+    # Clamp explicit requests to the devices visible to JAX.
+    n = min(n, len(cuda))
     devices = cuda[:n]
     try:
       mesh = jax.sharding.Mesh(
@@ -684,6 +688,8 @@ class MagentaRT2System:
       (waveform, state) — a Waveform at 48kHz stereo, and the updated state
       for continuation.
     """
+    if frames <= 0:
+      raise ValueError(f'frames must be positive, got {frames}')
     conditioning = conditioning or {}
     tokenized_conditioning = {}
     

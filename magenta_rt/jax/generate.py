@@ -17,8 +17,11 @@
 import logging
 import time
 
+# Configure XLA before importing any module that may import JAX.
+from magenta_rt.jax import _gpu_check
+_gpu_check.configure_jax_memory_defaults()
+
 from magenta_rt import paths
-from magenta_rt import MagentaRT2Jax
 from magenta_rt.config import MUSICCOCA
 
 logging.basicConfig(level=logging.INFO, force=True)
@@ -40,6 +43,13 @@ def main(
     num_devices: int | None = None,
     require_gpu: bool = True,
 ):
+    if duration <= 0:
+        raise ValueError(f"duration must be positive, got {duration}")
+
+    # Delay the heavy JAX model import until arguments are validated. This keeps
+    # CLI validation fast and avoids initializing a backend for bad input.
+    from magenta_rt import MagentaRT2Jax
+
     cfg_scales = {
         'musiccoca': cfg_musiccoca,
         'notes': cfg_notes,
@@ -59,7 +69,7 @@ def main(
 
     embedding = mrt.embed_style(prompt, use_mapper=True)
 
-    frames = int(duration * 25)
+    frames = max(1, round(duration * 25))
 
     # --- Benchmark ---
     start_time = time.time()
@@ -82,7 +92,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--model", default=paths.DEFAULT_MODEL_NAME, type=str,
                         help=f"Model variant name (default: {paths.DEFAULT_MODEL_NAME}).")
-    parser.add_argument("--prompt", default=None, type=str, help="Text conditioning for MusicCoCa.")
+    parser.add_argument("--prompt", default="disco funk", type=str, help="Text conditioning for MusicCoCa.")
     parser.add_argument("--temperature", default=1.3, type=float)
     parser.add_argument("--top-k", default=40, type=int)
     parser.add_argument("--cfg-musiccoca", default=3.0, type=float)
