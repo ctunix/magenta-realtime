@@ -56,27 +56,28 @@ The table below shows which devices support **real-time streaming** (generating 
 ## Quickstart on Kaggle / Colab (NVIDIA GPU, incl. 2x T4)
 
 Run this in a single Kaggle/Colab cell (GPU accelerator enabled). It clones this
-fork, installs a **pinned, non-drifting JAX/CUDA stack** into an **isolated
-venv** (so Kaggle's system packages — RAPIDS, pandas, jupyter-server — are not
-touched), downloads the model resources + the `mrt2_base` checkpoint, and
-quantizes it to bf16 so it fits on a T4. It is idempotent and safe to re-run.
+fork, installs a **pinned, non-drifting JAX/CUDA stack** (non-editable, so no
+kernel restart is needed), downloads the model resources + the `mrt2_base`
+checkpoint, and quantizes it to bf16 so it fits on a T4. It is idempotent and
+safe to re-run.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ctunix/magenta-realtime/main/scripts/install_kaggle.sh | bash
 ```
 
-When it finishes it prints the exact cells to run for generation. Those use the
-venv's `mrt` CLI with the JAX memory env vars set **before** the Python process
-starts, assert a GPU is present (no silent CPU fallback), shard the 2.4B model
-across 2 GPUs when 2 are present (tensor parallelism — ~5 GB/GPU fp32 or
-~2.6 GB/GPU bf16), and generate 8 s of audio. The full notebook is in
+When it finishes it prints the exact cells to run for generation. The generation
+runs in a **subprocess** (`python -m magenta_rt.jax.generate`) with the JAX
+memory env vars set **before** the Python process starts, so no kernel restart
+is needed. It asserts a GPU is present (no silent CPU fallback), shards the 2.4B
+model across 2 GPUs when 2 are present (tensor parallelism — ~5 GB/GPU fp32 or
+~2.6 GB/GPU bf16), and generates 8 s of audio. The full notebook is in
 [`notebooks/kaggle_2xt4_mrt2.ipynb`](notebooks/kaggle_2xt4_mrt2.ipynb).
 
 <details><summary>Or, the equivalent cells (run them after the install above)</summary>
 
 ```bash
 # --- Generate (sharded across 2 GPUs if present) ---
-!XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 MAGENTA_HOME=/kaggle/working /kaggle/working/mrt_venv/bin/mrt jax generate --model mrt2_base --checkpoint mrt2_base_bf16.safetensors --shard --duration 8 --prompt "disco funk"
+!XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.85 MAGENTA_HOME=/kaggle/working python3 -m magenta_rt.jax.generate --model mrt2_base --checkpoint mrt2_base_bf16.safetensors --shard --duration 8 --prompt "disco funk"
 ```
 
 ```python
@@ -90,9 +91,12 @@ ipd.display(ipd.Audio('/kaggle/working/magenta-rt-v2/outputs/output_audio_jax_mr
 Notes:
 - The install pins `jax==jaxlib==jax-cuda12-plugin==jax-cuda12-pjrt==0.10.1`,
   `numpy==2.3.5`, `numba==0.65.1` so the CUDA plugin can't drift out of sync.
-- It installs into a venv (`/kaggle/working/mrt_venv`) so it does **not** disturb
-  Kaggle's system packages. (MRT needs `numba>=0.65` for numpy 2.x, which is
-  incompatible with RAPIDS' `numba<0.62` — the venv keeps them separate.)
+- You may see pip "dependency conflict" warnings for Kaggle's pre-installed
+  RAPIDS (`cuml`/`cudf` want `numba<0.62`) — MRT needs `numba>=0.65` for numpy
+  2.x, so this conflict is unavoidable and harmless for running MRT; ignore it.
+- A venv is deliberately **not** used: `python -m venv` fails at `ensurepip` on
+  Kaggle/Colab. The non-editable install lets a subprocess import `magenta_rt`
+  without a kernel restart.
 - To use your own fork instead of `ctunix`, set `MRT_REPO` before the curl, e.g.
   `MRT_REPO=https://github.com/<you>/magenta-realtime.git curl ... | bash`.
 - `MAGENTA_HOME` must be the **base** dir (e.g. `/kaggle/working`); `paths.py`
