@@ -50,6 +50,12 @@ einops
 safetensors
 jaxtyping
 typing_extensions
+# recurrentgemma is imported at runtime by the vendored
+# sequence_layers.jax.recurrent; orbax-checkpoint is its [jax]-extra
+# dependency (imported by sequence_layers.jax.export, which is NOT loaded at
+# init). Pinned to uv.lock.
+recurrentgemma[jax]==1.0.1
+orbax-checkpoint==0.12.0
 
 # --- Project runtime deps (kept here so --no-deps install of the project still has everything) ---
 ai-edge-litert
