@@ -53,6 +53,69 @@ The table below shows which devices support **real-time streaming** (generating 
 
 > **Note:** Both models can also run **offline (non-real-time) inference** on any Apple Silicon Mac or NVIDIA GPU via the Python library. See more details on [`docs/models.md`](docs/models.md).
 
+## Quickstart on Kaggle / Colab (NVIDIA GPU, incl. 2x T4)
+
+Run this in a single Kaggle/Colab cell (GPU accelerator enabled). It clones this
+fork, installs a **pinned, non-drifting JAX/CUDA stack**, downloads the model
+resources + the `mrt2_base` checkpoint, and quantizes it to bf16 so it fits on a
+T4. It is idempotent and safe to re-run.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ctunix/magenta-realtime/main/scripts/install_kaggle.sh | bash
+```
+
+When it finishes it prints the exact Python cell to run for generation. That cell
+sets the JAX memory env vars **before** importing JAX, asserts a GPU is present
+(no silent CPU fallback), shards the 2.4B model across 2 GPUs when 2 are present
+(tensor parallelism — ~5 GB/GPU fp32 or ~2.6 GB/GPU bf16), and generates 8 s of
+audio. The full notebook is in [`notebooks/kaggle_2xt4_mrt2.ipynb`](notebooks/kaggle_2xt4_mrt2.ipynb).
+
+<details><summary>Or, the equivalent generation cell (run it after the install above)</summary>
+
+```python
+import os
+# Must be set BEFORE the first `import jax` so jaxlib reads them.
+os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+os.environ.setdefault('XLA_PYTHON_CLIENT_MEM_FRACTION', '0.85')
+os.environ.setdefault('MAGENTA_HOME', '/kaggle/working/magenta-rt-v2')  # /content/... on Colab
+
+import logging, jax
+logging.basicConfig(level=logging.INFO, force=True)
+from magenta_rt.jax import _gpu_check
+print(_gpu_check.diagnose_devices())
+_gpu_check.assert_gpu_available()          # fail loudly, no silent CPU fallback
+n_gpu = _gpu_check.num_local_cuda_devices()
+
+from magenta_rt import MagentaRT2Jax
+from magenta_rt.config import MUSICCOCA
+mrt = MagentaRT2Jax(
+    size='mrt2_base',
+    checkpoint='mrt2_base_bf16.safetensors',
+    shard=(n_gpu >= 2),                     # tensor-parallel across 2 GPUs if present
+    require_gpu=True,
+)
+print('Sharded:', mrt._sharded, '| mesh:', mrt._mesh)
+
+embedding = mrt.embed_style('disco funk', use_mapper=True)
+wav, state = mrt.generate(conditioning={MUSICCOCA.key: embedding}, frames=200)  # 8 s @ 25 Hz
+
+import IPython.display as ipd
+out = '/kaggle/working/mrt2_base_output.wav'
+wav.write(out)
+print('Saved', out)
+ipd.display(ipd.Audio(wav.samples.T, rate=wav.sample_rate))
+```
+
+</details>
+
+Notes:
+- The install pins `jax==jaxlib==jax-cuda12-plugin==jax-cuda12-pjrt==0.10.1`,
+  `numpy==2.3.5`, `numba==0.65.1` so the CUDA plugin can't drift out of sync.
+- To use your own fork instead of `ctunix`, set `MRT_REPO` before the curl, e.g.
+  `MRT_REPO=https://github.com/<you>/magenta-realtime.git curl ... | bash`.
+- `mrt2_base` is 2.4B params; on a single T4 use the **bf16** checkpoint
+  (`mrt checkpoints quantize mrt2_base`), on 2x T4 it also shards across GPUs.
+
 ## Quickstart on Apple Silicon
 
 ```bash
