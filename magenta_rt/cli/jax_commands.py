@@ -34,8 +34,32 @@ def jax():
 @click.option("--cfg-musiccoca", default=3.0, type=float)
 @click.option("--cfg-notes", default=1.0, type=float)
 @click.option("--checkpoint", default=None, type=str, help="Checkpoint filename in checkpoints/ directory.")
+@click.option(
+    "--shard",
+    is_flag=True,
+    default=False,
+    help="Shard the model across all local CUDA GPUs (tensor parallelism). "
+         "Falls back to single-GPU if fewer than 2 GPUs are detected.",
+)
+@click.option(
+    "--num-devices",
+    "num_devices",
+    default=None,
+    type=int,
+    help="Shard across this many GPUs (implies --shard). Capped to the number "
+         "of local CUDA devices.",
+)
+@click.option(
+    "--no-require-gpu",
+    "no_require_gpu",
+    is_flag=True,
+    default=False,
+    help="Allow CPU execution (for testing). By default the command fails loudly "
+         "if no CUDA GPU is available instead of silently falling back to CPU.",
+)
 def generate(prompt, model, duration, temperature, top_k,
-             cfg_musiccoca, cfg_notes, checkpoint):
+              cfg_musiccoca, cfg_notes, checkpoint, shard, num_devices,
+              no_require_gpu):
     """Generate audio with the JAX backend."""
     from magenta_rt.jax.generate import main as run
 
@@ -48,5 +72,8 @@ def generate(prompt, model, duration, temperature, top_k,
         cfg_musiccoca=cfg_musiccoca,
         cfg_notes=cfg_notes,
         duration=duration,
+        shard=shard,
+        num_devices=num_devices,
+        require_gpu=not no_require_gpu,
     )
     run(**kwargs)

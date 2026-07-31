@@ -1,0 +1,64 @@
+# Kaggle / Colab (NVIDIA CUDA 12, e.g. 2x T4) dependency pin for Magenta RealTime 2.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `uv pip install -e ".[jax]"` installs the *CPU/macOS* jax (the project's [jax]
+# extra is just `jax`, not `jax[cuda12]`). On a CUDA box you must instead bring
+# your own `jax[cuda12]`, which pulls four separately-versioned packages:
+#
+#   jax , jaxlib , jax-cuda12-plugin , jax-cuda12-pjrt
+#
+# These four MUST be the exact same version. If any one drifts (e.g. the project
+# reinstalling `jax` while the cuda plugin stays put) you get silent CPU
+# fallback with errors like:
+#   * "RuntimeError: Unable to load cuSPARSE"
+#   * "JAX plugin jax_cuda12_plugin version X is not compatible with jaxlib Y"
+#
+# This file pins all four to ONE version (0.10.1, matching the repo's uv.lock)
+# plus numpy and numba, and is installed with `--no-deps` for the project so the
+# project's own [jax] extra can never reinstall one without the others.
+#
+# numpy / numba note
+# ------------------
+# The original conflict ("numba requires numpy<2.1") was true for old numba.
+# numba>=0.65 supports numpy 2.x (requires `numpy>=1.22,<2.5`). jax 0.10.1
+# requires `numpy>=2.0`. The intersection [2.0, 2.5) is non-empty, so we pin
+# numba==0.65.1 and numpy==2.3.5 (the version already validated by the repo's
+# uv.lock). If you ever need an older numba, drop numpy to `numpy==2.0.2`
+# (last 2.0.x) which still satisfies jax>=2.0 and numba<2.5.
+#
+# INSTALL ORDER (see notebooks/kaggle_2xt4_mrt2.ipynb for the full sequence):
+#   uv pip install -r requirements-kaggle.txt
+#   uv pip install -e . --no-deps        # project, WITHOUT touching deps
+#   mrt models init                       # musiccoca + spectrostream
+#   mrt checkpoints download mrt2_base    # NOTE: positional, not --model=
+
+# --- Core JAX stack: all four MUST match exactly -----------------------------
+jax==0.10.1
+jaxlib==0.10.1
+jax-cuda12-plugin==0.10.1
+jax-cuda12-pjrt==0.10.1
+
+# --- numpy / numba: pinned together to prevent drift ------------------------
+numpy==2.3.5
+numba==0.65.1
+
+# --- JAX ecosystem (match the repo's uv.lock) --------------------------------
+flax==0.12.7
+optax==0.2.8
+einops
+safetensors
+jaxtyping
+typing_extensions
+
+# --- Project runtime deps (kept here so --no-deps install of the project still has everything) ---
+ai-edge-litert
+click
+scipy
+google-cloud-storage
+huggingface_hub
+simple-term-menu
+librosa
+resampy
+sentencepiece
+soundfile

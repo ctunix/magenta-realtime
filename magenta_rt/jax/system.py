@@ -14,6 +14,7 @@
 
 """Magenta RealTime system for streaming audio generation."""
 
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -27,6 +28,7 @@ import safetensors.flax as safetensors_flax
 import flax.traverse_util as flaxtu
 
 from . import depthformer
+from . import _gpu_check
 from . import model as model_configs
 from . import spectrostream
 from .. import audio
@@ -38,6 +40,11 @@ from ..config import MUSICCOCA
 logger = logging.getLogger(__name__)
 
 NUM_RESERVED_TOKENS = 6
+
+# Mesh axis names used for tensor-parallel sharding. These match the mesh assumed
+# by transformer.get_default_sharding_config (replica, data, seq, model). Only
+# the 'model' axis (size = #GPUs) actually shards; the others are size-1.
+_SHARD_MESH_AXES = ('replica', 'data', 'seq', 'model')
 
 
 def discretize_cfg(value: float, step: float, max_bin: int) -> int:
@@ -175,14 +182,166 @@ def _load_jax_weights(path) -> dict:
   return flaxtu.unflatten_dict(nested_dict)
 
 
+# ---------------------------------------------------------------------------
+# Tensor-parallel sharding specs (Megatron-style), derived from the model's
+# ShardingConfig (transformer.get_default_sharding_config) by param-name
+# pattern.
+#
+# We derive specs by name rather than from a Flax `init` trace because the
+# model's forward methods cannot be run under `jax.eval_shape`: the embedding
+# layer's `nn.dtypes.promote_dtype` casts the abstract param through
+# `jnp.asarray(ShapeDtypeStruct, dtype)`, which JAX 0.10 routes to `np.asarray`
+# and raises. `get_initial_state` traces but only creates state-related params
+# (embeddings, per_dim_scale, sink_*), never the projection/FFN kernels that
+# hold the bulk of the parameters. So we instead map each loaded param's Flax
+# path to the PartitionSpec the ShardingConfig assigns it. The rules below are
+# the exact Megatron sharding the model was designed with (column-parallel
+# up-projection, row-parallel down-projection, head-parallel attention), which
+# XLA/GSPMD turns into the correct all-gather / reduce-scatter collectives.
+#
+# Replicating a param whose kernel is sharded is always safe (GSPMD reshard),
+# so any param not matching a rule is left replicated — only the bulk kernels
+# are sharded, which is where the memory win comes from.
+# ---------------------------------------------------------------------------
+PS = jax.sharding.PartitionSpec
+
+
+def _partition_spec_for_key(key, shape) -> jax.sharding.PartitionSpec:
+  """Return the tensor-parallel PartitionSpec for a param given its path.
+
+  Args:
+    key: Flax tuple path of the param (e.g. ('params','...','ffn_layer1','kernel')).
+    shape: shape of the param array.
+
+  Returns:
+    A PartitionSpec. PS() (all-None) means replicated.
+  """
+  last = str(key[-1]) if key else ''
+  parent = str(key[-2]) if len(key) >= 2 else ''
+  ndim = len(shape)
+
+  # Attention input/output projection kernels. The model uses separate q/k/v
+  # (self-attention) and separate kv (cross-attention); handle the combined
+  # variants too for safety. These are EinsumDense kernels of shape
+  # [model_dim, num_heads, units_per_head] (or with an extra "2"/"3" axis for
+  # combined kv/qkv). Shard the *heads* axis on 'model'.
+  if last == 'kernel' and parent in (
+      'query_projection', 'key_projection', 'value_projection',
+      'output_projection'):
+    # [d, h, u] -> shard heads (axis 1) on 'model'.
+    if ndim == 3:
+      return PS(None, 'model', None)
+    # combined qkv [d, 3, h, u] or kv [src, 2, h, u] -> shard heads (axis 2).
+    if ndim == 4:
+      return PS(None, None, 'model', None)
+    return PS()
+
+  if last == 'kernel' and parent in (
+      'query_key_value_projection', 'key_value_projection',
+      'shared_key_value_projection'):
+    # combined: [d, 3, h, u] or [src, 2, h, u] -> shard heads (axis 2) on 'model'.
+    if ndim == 4:
+      return PS(None, None, 'model', None)
+    return PS()
+
+  # FFN: column-parallel up-projection (shard fan_out=hidden on 'model') and
+  # row-parallel down-projection (shard fan_in=hidden on 'model').
+  if last == 'kernel' and parent == 'ffn_layer1' and ndim == 2:
+    return PS(None, 'model')          # [model_dim, hidden*2] -> shard hidden
+  if last == 'kernel' and parent == 'ffn_layer2' and ndim == 2:
+    return PS('model', None)          # [hidden, model_dim] -> shard hidden
+
+  # Everything else (biases, RMSNorm/LayerNorm scales, embeddings, to_logits,
+  # per_dim_scale, sink_*, depth_input_adapter) is left replicated: these are
+  # either tiny or their reductions must see the full vector. Replicating them
+  # is always correct (GSPMD reshard/broadcast as needed).
+  return PS()
+
+
+def _place_params_on_mesh(params, mesh, num_devices):
+  """Shard a loaded checkpoint's params across ``mesh`` for tensor parallelism.
+
+  Assigns each param a PartitionSpec via ``_partition_spec_for_key`` (Megatron
+  rules from the model's ShardingConfig) and places it with ``jax.device_put``
+  + ``NamedSharding`` so XLA/GSPMD inserts the collective matmuls. Params whose
+  sharded axis is not divisible by ``num_devices`` are left replicated (safe).
+
+  Args:
+    params: Nested Flax param dict from ``_load_jax_weights``.
+    mesh: A ``jax.sharding.Mesh`` with a 'model' axis of size >= 2.
+    num_devices: Number of devices on the 'model' axis (for divisibility check).
+
+  Returns:
+    A param dict with arrays placed (sharded/replicated) on the mesh.
+  """
+  flat_params = flaxtu.flatten_dict(params, sep=None)
+  flat_sharding = {}
+  num_sharded = 0
+  num_replicated = 0
+  for key, arr in flat_params.items():
+    spec = _partition_spec_for_key(key, arr.shape)
+    # Safety: if the sharded axis isn't divisible by num_devices, replicate.
+    if _spec_is_sharded(spec):
+      axis_idx = _sharded_axis(spec)
+      if axis_idx is None or axis_idx >= arr.ndim or arr.shape[axis_idx] % num_devices != 0:
+        spec = PS()
+    if _spec_is_sharded(spec):
+      num_sharded += 1
+    else:
+      num_replicated += 1
+    flat_sharding[key] = jax.sharding.NamedSharding(mesh, spec)
+  logger.info(
+      'Param placement: %d sharded, %d replicated across %d GPU(s).',
+      num_sharded, num_replicated, num_devices,
+  )
+  # Single device_put of the whole tree (one host->device transfer, not one per
+  # param) — much faster than 600+ individual calls.
+  sharding_tree = flaxtu.unflatten_dict(flat_sharding)
+  return jax.device_put(params, sharding_tree)
+
+
+def _spec_is_sharded(spec) -> bool:
+  return any(a is not None for a in spec)
+
+
+def _sharded_axis(spec):
+  """Index of the single sharded axis in a 1-mesh-axis PartitionSpec, or None."""
+  for i, a in enumerate(spec):
+    if a is not None:
+      return i
+  return None
+
+
+def _log_device_memory(sharded: bool) -> None:
+  """Log per-CUDA-device memory usage (best-effort; never raises)."""
+  try:
+    cuda = [d for d in jax.devices() if d.platform == 'gpu']
+    for d in cuda:
+      stats = d.memory_stats() or {}
+      used = stats.get('bytes_in_use', 0)
+      limit = stats.get('limit') or stats.get('bytes_limit') or 0
+      peak = stats.get('peak_bytes_in_use', 0)
+      if limit:
+        logger.info(
+            '  %s: %.2f GB / %.2f GB in use (peak %.2f GB)%s',
+            d, used / 1e9, limit / 1e9, peak / 1e9,
+            ' [sharded]' if sharded else '',
+        )
+  except Exception:  # noqa: BLE001 - diagnostic only
+    pass
+
+
 class MagentaRT2System:
   """A MagentaRT2 streaming system that takes style and notes inputs and generates audio.
 
   Example::
 
-      mrt = MagentaRT2System(size='mrt2_base')
+      from magenta_rt.config import MUSICCOCA
+      mrt = MagentaRT2System(size='mrt2_base')  # add shard=True for 2 GPUs
       embedding = mrt.embed_style('disco funk')
-      wav, state = mrt.generate(style=embedding, frames=25)
+      wav, state = mrt.generate(
+          conditioning={MUSICCOCA.key: embedding}, frames=25,
+      )
   """
 
   def __init__(
@@ -193,6 +352,9 @@ class MagentaRT2System:
       temperature: float = 1.3,
       top_k: int = 40,
       cfg_scales: dict[str, float] | None = None,
+      shard: bool = False,
+      num_devices: int | None = None,
+      require_gpu: bool = True,
   ):
     """Initialise the system: build model, load weights, JIT-compile.
 
@@ -207,7 +369,17 @@ class MagentaRT2System:
           Standard models need musiccoca, notes, and drums.
           Note: The CFG scales don't expand the inference batch but are used
           as additional conditioning tokens.
+      shard: If True, shard the model across all local CUDA GPUs (tensor
+          parallelism on the 'model' mesh axis). Falls back to single-GPU if
+          fewer than 2 GPUs are available or sharding setup fails.
+      num_devices: If set and > 1, shard across this many GPUs (capped to the
+          number of local CUDA devices). Implies shard=True.
+      require_gpu: If True (default), fail loudly if no CUDA GPU is available
+          instead of silently falling back to CPU. Set False for CPU testing.
     """
+    # Apply default XLA memory env vars (idempotent; existing env wins).
+    _gpu_check.configure_jax_memory_defaults()
+
     self._model = model_configs.get_model_class(size)()
     self._size = size
     self._style_model = style_model or musiccoca.MusicCoCa()
@@ -258,10 +430,73 @@ class MagentaRT2System:
       x.rvq_truncation_level for x in self._model.input_configs
     )
 
+    # --- GPU presence check (loud-fail, no silent CPU fallback) ---
+    if require_gpu:
+      _gpu_check.assert_gpu_available()
+    logger.info('JAX devices:\n%s', _gpu_check.diagnose_devices())
+
+    # --- Multi-GPU sharding (tensor parallelism) ---
+    self._mesh = None
+    self._sharded = False
+    want_shard = shard or (num_devices is not None and num_devices > 1)
+    if want_shard:
+      self._setup_sharding(num_devices)
+
     # --- AOT-compiled functions ---
     self._jit_init_state = None
     self._jit_streaming_step = None
     self._compile()
+
+  def _setup_sharding(self, num_devices: int | None) -> None:
+    """Create a tensor-parallel mesh and place params sharded across GPUs.
+
+    On any failure (too few GPUs, spec-recovery mismatch, etc.) this logs a
+    warning and leaves the system in single-GPU mode (params un-sharded).
+    """
+    cuda = [d for d in jax.devices() if d.platform == 'gpu']
+    n = num_devices or len(cuda)
+    if len(cuda) < 2 or n < 2:
+      logger.warning(
+          'Sharding requested but only %d CUDA device(s) available; '
+          'running single-GPU (no sharding).', len(cuda)
+      )
+      return
+    devices = cuda[:n]
+    try:
+      mesh = jax.sharding.Mesh(
+          np.array(devices).reshape((1, 1, 1, n)), _SHARD_MESH_AXES,
+      )
+    except Exception as e:  # noqa: BLE001
+      logger.warning('Could not build a %d-GPU mesh (%s); single-GPU.', n, e)
+      return
+
+    try:
+      self._params = _place_params_on_mesh(self._params, mesh, n)
+    except Exception as e:  # noqa: BLE001
+      logger.warning(
+          'Sharded param placement failed (%s); falling back to single-GPU. '
+          'The model will still run on one GPU (use a bf16 checkpoint to fit '
+          'mrt2_base on a single T4).', e
+      )
+      return
+
+    self._mesh = mesh
+    self._sharded = True
+    logger.info(
+        'Sharded model across %d GPU(s) via tensor parallelism (mesh=%s).',
+        n, mesh,
+    )
+
+  def _mesh_ctx(self):
+    """Context manager: set the sharding mesh, or a no-op when single-GPU.
+
+    Uses ``jax.set_mesh`` (the non-deprecated API; ``with mesh:`` is deprecated
+    and can be disabled entirely via JAX config). ``set_mesh`` may only be used
+    OUTSIDE of ``jax.jit``, which is our usage (we wrap the compile/call sites).
+    """
+    if self._mesh is not None:
+      return jax.set_mesh(self._mesh)
+    return contextlib.nullcontext()
 
   def _compile(self):
     """AOT-compile init_state and streaming_step."""
@@ -308,10 +543,14 @@ class MagentaRT2System:
     block, constants = self._build_conditioning(conditioning)
 
     init_constants = {}
-    state = self._jit_init_state(self._params, init_constants)
-    self._jit_streaming_step = _streaming_step.lower(
-        self._params, block, constants, state
-    ).compile()
+    # Trace/compile inside the mesh so GSPMD applies the tensor-parallel
+    # sharding to the params (which were placed sharded) and inserts the
+    # collective matmuls. In single-GPU mode self._mesh is None (no-op ctx).
+    with self._mesh_ctx():
+      state = self._jit_init_state(self._params, init_constants)
+      self._jit_streaming_step = _streaming_step.lower(
+          self._params, block, constants, state
+      ).compile()
 
     logger.info('Compilation time: %.1fs', time.time() - t0)
 
@@ -464,16 +703,22 @@ class MagentaRT2System:
     # --- Init state if needed ---
     if state is None:
       init_constants = {}
-      state = self._jit_init_state(self._params, init_constants)
+      with self._mesh_ctx():
+        state = self._jit_init_state(self._params, init_constants)
 
     # --- Streaming generation ---
+    # NOTE: generation is already streaming/chunked over time: each iteration
+    # runs exactly one frame through the compiled step and carries the KV cache
+    # in `state`. Peak memory is O(1) per step and does NOT scale with
+    # `frames`/`--duration`; only the (small) int16 outputs accumulate.
     results = []
     t0 = time.time()
-    for _ in range(frames):
-      step_output, state, _ = self._jit_streaming_step(
-          self._params, block, constants, state
-      )
-      results.append(step_output)
+    with self._mesh_ctx():
+      for _ in range(frames):
+        step_output, state, _ = self._jit_streaming_step(
+            self._params, block, constants, state
+        )
+        results.append(step_output)
 
     # --- Assemble audio ---
     samples = sl.Sequence.concatenate_sequences(results).values[0]
@@ -484,6 +729,8 @@ class MagentaRT2System:
         'Generated %d frames in %.2fs (%.1f ms/step, %.1f steps/s)',
         frames, elapsed, ms_per_step, frames / elapsed,
     )
+    # Per-device memory diagnostic (best-effort; CUDA only).
+    _log_device_memory(self._sharded)
     # samples shape: [T*1920, 2] (interleaved stereo int16)
     waveform = audio.Waveform(samples.astype(np.float32) / 32768.0, sample_rate=self._sample_rate)
 

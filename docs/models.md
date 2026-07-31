@@ -35,9 +35,11 @@ Use the `mrt models` CLI to fetch models (automatically saved in `~/Documents/Ma
 # MusicCoCa and SpectroStream
 mrt models init
 
-# Download Depthformer models
-# exported in mlxfn format
-mrt models download
+# Download Depthformer models (exported in mlxfn format).
+# NAME is a POSITIONAL argument (not --model=...). Omit it for the
+# interactive picker.
+mrt models download mrt2_base
+mrt models download            # interactive picker
 ```
 
 Expected directory layout:
@@ -67,3 +69,22 @@ Expected directory layout:
 ## Download raw checkpoints
 
 One may find raw model checkpoints (safetensors before exporting to mlxfn) useful for research purposes. Thus we offer them via `mrt checkpoints download` CLI.
+
+```bash
+# NAME is POSITIONAL (not --model=...). Accepts a bare name or full filename.
+mrt checkpoints download mrt2_base          # -> checkpoints/mrt2_base.safetensors
+```
+
+## Quantize a checkpoint (fp32 -> bf16)
+
+For GPU inference (e.g. a single T4) the 2.4B fp32 checkpoint (~9.84 GB) can
+be halved to bf16 (~4.92 GB) so it fits in 16 GB with headroom for activations.
+The model already computes in bfloat16, so this only changes storage/param
+memory, not numerics.
+
+```bash
+mrt checkpoints quantize mrt2_base          # -> checkpoints/mrt2_base_bf16.safetensors
+mrt checkpoints quantize mrt2_base --keep-fp32 norm --keep-fp32 scale
+# Then run inference on the smaller checkpoint:
+mrt jax generate --checkpoint mrt2_base_bf16.safetensors --duration 8.0
+```

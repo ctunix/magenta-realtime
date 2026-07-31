@@ -574,3 +574,98 @@ def download(name, download_path, source):
         )
 
     click.echo(click.style(f"\n✓ Checkpoint '{name}' downloaded.", fg="green", bold=True))
+
+
+@checkpoints.command()
+@click.argument("name")
+@click.option(
+    "--output",
+    default=None,
+    type=str,
+    help=(
+        "Output filename (in the same checkpoints/ dir). Defaults to "
+        "<name without .safetensors>_bf16.safetensors."
+    ),
+)
+@click.option(
+    "--dtype",
+    default="bf16",
+    type=click.Choice(["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"]),
+    show_default=True,
+    help="Target dtype for quantization.",
+)
+@click.option(
+    "--keep-fp32",
+    "keep_fp32",
+    multiple=True,
+    default=(),
+    help=(
+        "Param-name substring to keep in fp32 (repeatable). E.g. "
+        "--keep-fp32 norm --keep-fp32 scale. Default: quantize everything."
+    ),
+)
+@click.option(
+    "--download-path",
+    type=click.Path(),
+    default=str(_DEFAULT_DOWNLOAD_PATH),
+    show_default=True,
+    help="Root directory for downloaded assets.",
+)
+def quantize(name, output, dtype, keep_fp32, download_path):
+    """Quantize a raw checkpoint (fp32 -> bf16/fp16) to halve its memory.
+
+    Writes a new .safetensors checkpoint in the checkpoints/ dir. The model
+    already computes in bfloat16, so a bf16 checkpoint only changes storage
+    (and on-GPU param memory), not numerics. mrt2_base: 9.84 GB -> ~4.92 GB,
+    which fits on a single T4. Pass --checkpoint=<file> to MagentaRT2Jax to
+    load the quantized version.
+
+    \b
+    Examples:
+      mrt checkpoints quantize mrt2_base                 # -> mrt2_base_bf16.safetensors
+      mrt checkpoints quantize mrt2_base.safetensors --dtype bf16
+      mrt checkpoints quantize mrt2_base --keep-fp32 norm --keep-fp32 scale
+    """
+    from magenta_rt.jax import quantize as qmod  # noqa: E402
+
+    download_path = Path(download_path)
+    ckpt_dir = download_path / "checkpoints"
+
+    src_name = name
+    if not src_name.endswith(".safetensors"):
+        src_name = f"{src_name}.safetensors"
+    src = ckpt_dir / src_name
+    if not src.exists():
+        # Also accept a literal path outside the checkpoints dir.
+        if Path(name).exists():
+            src = Path(name)
+        else:
+            click.echo(
+                click.style("Error: ", fg="red", bold=True)
+                + f"Checkpoint not found: {src}",
+                err=True,
+            )
+            sys.exit(1)
+
+    if output is None:
+        stem = src.stem  # e.g. "mrt2_base"
+        out_name = f"{stem}_{dtype}.safetensors"
+    else:
+        out_name = output if output.endswith(".safetensors") else f"{output}.safetensors"
+    dst = src.parent / out_name
+
+    click.echo(
+        f"Quantizing {click.style(str(src), fg='cyan')} -> "
+        f"{click.style(str(dst), fg='cyan')} (dtype={dtype})"
+    )
+    result = qmod.quantize_checkpoint(
+        src, dst, target_dtype=dtype, keep_fp32_patterns=list(keep_fp32)
+    )
+    saved_pct = 100.0 * (1.0 - result["dst_bytes"] / max(result["src_bytes"], 1))
+    click.echo(
+        click.style("✓ Quantized. ", fg="green", bold=True)
+        + f"{result['src_bytes'] / 1e9:.2f} GB -> "
+        f"{result['dst_bytes'] / 1e9:.2f} GB ({saved_pct:.0f}% smaller), "
+        f"{result['num_params']:,} params, {result['num_kept_fp32']} kept fp32."
+    )
+    click.echo(f"  Load with: mrt jax generate --checkpoint {out_name} ...")

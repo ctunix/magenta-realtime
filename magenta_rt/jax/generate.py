@@ -35,6 +35,10 @@ def main(
     # utils
     checkpoint: str | None = None,
     duration: float = 4.0,
+    # multi-GPU
+    shard: bool = False,
+    num_devices: int | None = None,
+    require_gpu: bool = True,
 ):
     cfg_scales = {
         'musiccoca': cfg_musiccoca,
@@ -48,6 +52,9 @@ def main(
         temperature=temperature,
         top_k=top_k,
         cfg_scales=cfg_scales,
+        shard=shard,
+        num_devices=num_devices,
+        require_gpu=require_gpu,
     )
 
     embedding = mrt.embed_style(prompt, use_mapper=True)
@@ -87,6 +94,18 @@ if __name__ == "__main__":
         type=str,
         help='Checkpoint filename in checkpoints/ directory.'
     )
+    parser.add_argument(
+        '--shard', action='store_true',
+        help='Shard the model across all local CUDA GPUs.'
+    )
+    parser.add_argument(
+        '--num-devices', default=None, type=int,
+        help='Shard across this many GPUs (implies --shard).'
+    )
+    parser.add_argument(
+        '--no-require-gpu', action='store_true',
+        help='Allow CPU execution (testing only).'
+    )
     args = parser.parse_args()
 
     main(
@@ -98,4 +117,7 @@ if __name__ == "__main__":
         cfg_notes=args.cfg_notes,
         checkpoint=args.checkpoint,
         duration=args.duration,
+        shard=args.shard,
+        num_devices=args.num_devices,
+        require_gpu=not args.no_require_gpu,
     )
