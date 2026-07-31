@@ -437,6 +437,7 @@ class MagentaRT2System:
 
     # --- Multi-GPU sharding (tensor parallelism) ---
     self._mesh = None
+    self._state_boundary_sharding = None
     self._sharded = False
     want_shard = shard or (num_devices is not None and num_devices > 1)
     if want_shard:
@@ -482,6 +483,14 @@ class MagentaRT2System:
 
     self._mesh = mesh
     self._sharded = True
+    # GSPMD shards the recurrent state channels internally (they feed the
+    # sharded params), but the step executable's input signature is baked from
+    # the replicated init-state at compile time. Pinning the step OUTPUT state
+    # back to replicated keeps every subsequent call consistent with that
+    # signature (otherwise step N>1 raises "input shardings disagree").
+    self._state_boundary_sharding = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()
+    )
     logger.info(
         'Sharded model across %d GPU(s) via tensor parallelism (mesh=%s).',
         n, mesh,
@@ -523,11 +532,22 @@ class MagentaRT2System:
 
     @functools.partial(jax.jit, donate_argnums=(3,))
     def _streaming_step(params, x, constants, state):
-      return self._sampler.apply(
+      outputs = self._sampler.apply(
           params, x=x, state=state, constants=constants,
           training=False, rngs=rngs,
           method=self._sampler.step_with_emits,
       )
+      if self._state_boundary_sharding is not None:
+        # Pin the returned state to the replicated boundary so the next call
+        # matches the compiled input signature (see _setup_sharding).
+        return (
+            outputs[0],
+            jax.lax.with_sharding_constraint(
+                outputs[1], self._state_boundary_sharding
+            ),
+            outputs[2],
+        )
+      return outputs
 
     self._jit_init_state = _init_state
 
